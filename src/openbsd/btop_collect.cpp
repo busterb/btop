@@ -127,7 +127,7 @@ namespace Shared {
 		//? Shared global variables init
 		int mib[2];
 		mib[0] = CTL_HW;
-		mib[1] = HW_NCPU;
+		mib[1] = HW_NCPUONLINE;
 		int ncpu;
 		size_t len = sizeof(ncpu);
 		if (sysctl(mib, 2, &ncpu, &len, nullptr, 0) == -1) {
@@ -392,12 +392,21 @@ namespace Cpu {
 			Logger::error("failed to get load averages");
 		}
 
+		//? Read total physical CPU count for sysctl iteration (may differ from
+		//? coreCount when SMT is disabled via hw.smt=0).
+		int ncpuTotal = Shared::coreCount;
+		{
+			int mib[] = {CTL_HW, HW_NCPU};
+			size_t len = sizeof(ncpuTotal);
+			sysctl(mib, 2, &ncpuTotal, &len, nullptr, 0);
+		}
+
 		auto cp_time = std::unique_ptr<struct cpustats[]>{
-			new struct cpustats[Shared::coreCount]
+			new struct cpustats[ncpuTotal]
 		};
 		size_t size = sizeof(struct cpustats);
 		static int cpustats_mib[] = {CTL_KERN, KERN_CPUSTATS, /*fillme*/0};
-		for (int i = 0; i < Shared::coreCount; i++) {
+		for (int i = 0; i < ncpuTotal; i++) {
 			cpustats_mib[2] = i;
 			if (sysctl(cpustats_mib, 3, &cp_time[i], &size, NULL, 0) == -1) {
 				Logger::error("sysctl kern.cpustats failed");
@@ -407,7 +416,13 @@ namespace Cpu {
 		long long global_idles = 0;
 		vector<long long> times_summed = {0, 0, 0, 0};
 
-		for (long i = 0; i < Shared::coreCount; i++) {
+		//? j is the display slot index, incremented only for online CPUs.
+		//? i iterates all physical CPUs; offline ones (CPUSTATS_ONLINE unset)
+		//? are skipped, matching the behaviour of top(1).
+		for (long i = 0, j = 0; i < ncpuTotal; i++) {
+			if (!(cp_time[i].cs_flags & CPUSTATS_ONLINE))
+				continue;
+
 			vector<long long> times;
 			//? 0=user, 1=nice, 2=system, 3=idle
 			for (int x = 0; const unsigned int c_state : {CP_USER, CP_NICE, CP_SYS, CP_IDLE}) {
@@ -426,22 +441,22 @@ namespace Cpu {
 				global_idles += idles;
 
 				//? Calculate cpu total for each core
-				if (i > Shared::coreCount) break;
-				const long long calc_totals = max(0ll, totals - core_old_totals.at(i));
-				const long long calc_idles = max(0ll, idles - core_old_idles.at(i));
-				core_old_totals.at(i) = totals;
-				core_old_idles.at(i) = idles;
+				if (j >= Shared::coreCount) { j++; continue; }
+				const long long calc_totals = max(0ll, totals - core_old_totals.at(j));
+				const long long calc_idles = max(0ll, idles - core_old_idles.at(j));
+				core_old_totals.at(j) = totals;
+				core_old_idles.at(j) = idles;
 
-				cpu.core_percent.at(i).push_back(clamp((long long)round((double)(calc_totals - calc_idles) * 100 / calc_totals), 0ll, 100ll));
+				cpu.core_percent.at(j).push_back(clamp((long long)round((double)(calc_totals - calc_idles) * 100 / calc_totals), 0ll, 100ll));
 
 				//? Reduce size if there are more values than needed for graph
-				if (cpu.core_percent.at(i).size() > 40) cpu.core_percent.at(i).pop_front();
+				if (cpu.core_percent.at(j).size() > 40) cpu.core_percent.at(j).pop_front();
 
 			} catch (const std::exception &e) {
 				Logger::error("Cpu::collect() : {}", e.what());
 				throw std::runtime_error(fmt::format("collect() : {}", e.what()));
 			}
-
+			j++;
 		}
 
 		const long long calc_totals = max(1ll, global_totals - cpu_old.at("totals"));
